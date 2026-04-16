@@ -1,0 +1,41 @@
+# Python cache and test artifacts
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments and local editor files
+.venv/
+venv/
+env/
+.env
+.DS_Store
+.idea/
+.vscode/
+
+# Logs and runtime outputs
+*.log
+runs/
+logs/
+wandb/
+
+# Training checkpoints and exported artifacts
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.pkl
+*.npz
+
+# Large dataset and generated map assets
+nuScenes/
+annotation_files/
+SatImgTiles/
+offset_grid_data/
+AID4AD_ego_referenced/
+
+# SatforHDMap local assets
+SatforHDMap_modified/dataset/
+SatforHDMap_modified/satmap/
+
