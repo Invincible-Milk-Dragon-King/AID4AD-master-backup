@@ -12,6 +12,13 @@ from .swin_t import Fusion_SwinTrans
 from .deform_t import FusionDeTrans
 from .masked_t import Fusion_Atten_Masked
 from .masked_seg_t import Fusion_Atten_Masked_Seg
+from branch_experiments.protocol import (
+    BRANCH_MODE_CAMERA_ONLY,
+    BRANCH_MODE_DROP_CAMERA,
+    BRANCH_MODE_DROP_SATELLITE,
+    BRANCH_MODE_FUSION,
+    BRANCH_MODE_SAT_ONLY,
+)
 
 
 class ViewTransformation(nn.Module):
@@ -51,6 +58,8 @@ class HDMapNet(nn.Module):
         self.hiddenC = 256
         self.downsample = 16
         self.fusion_mode = args.fusion_mode
+        self.branch_mode = getattr(args, 'branch_mode', 'fusion')
+        self.return_branch_features = getattr(args, 'return_branch_features', False)
 
         dx, bx, nx = gen_dx_bx(data_conf['xbound'], data_conf['ybound'], data_conf['zbound'])
         final_H, final_W = nx[1].item(), nx[0].item()
@@ -73,11 +82,29 @@ class HDMapNet(nn.Module):
         # self.direction_loss_fn = torch.nn.BCELoss(reduction='none')
 
         self.lidar = lidar
+        self.camera_feature_channels = self.camC + (128 if lidar else 0)
+        self.fusion_feature_channels = self.camera_feature_channels + self.priormapC
+        self.camera_bevencode = BevEncode(
+            inC=self.camera_feature_channels,
+            outC=data_conf['num_channels'],
+            instance_seg=instance_seg,
+            embedded_dim=embedded_dim,
+            direction_pred=direction_pred,
+            direction_dim=direction_dim+1,
+        )
+        self.satellite_bevencode = BevEncode(
+            inC=self.priormapC,
+            outC=data_conf['num_channels'],
+            instance_seg=instance_seg,
+            embedded_dim=embedded_dim,
+            direction_pred=direction_pred,
+            direction_dim=direction_dim+1,
+        )
         if lidar:
             self.pp = PointPillarEncoder(128, data_conf['xbound'], data_conf['ybound'], data_conf['zbound'])
-            self.bevencode = BevEncode(inC=self.camC+self.priormapC+128, outC=data_conf['num_channels'], instance_seg=instance_seg, embedded_dim=embedded_dim, direction_pred=direction_pred, direction_dim=direction_dim+1)
+            self.bevencode = BevEncode(inC=self.fusion_feature_channels, outC=data_conf['num_channels'], instance_seg=instance_seg, embedded_dim=embedded_dim, direction_pred=direction_pred, direction_dim=direction_dim+1)
         else:
-            self.bevencode = BevEncode(inC=self.camC+self.priormapC, outC=data_conf['num_channels'], instance_seg=instance_seg, embedded_dim=embedded_dim, direction_pred=direction_pred, direction_dim=direction_dim+1)
+            self.bevencode = BevEncode(inC=self.fusion_feature_channels, outC=data_conf['num_channels'], instance_seg=instance_seg, embedded_dim=embedded_dim, direction_pred=direction_pred, direction_dim=direction_dim+1)
             if args.fusion_mode == 'attention':
                 self.fusion = Fusion_Atten(bev_channels=self.camC, prior_channels=self.priormapC, hidden_c=self.hiddenC)
             elif args.fusion_mode == 'swin-atten':
@@ -111,19 +138,115 @@ class HDMapNet(nn.Module):
         x = x.view(B, N, self.camC, imH//self.downsample, imW//self.downsample)
         return x
 
-    def forward(self, img, trans, rots, intrins, post_trans, post_rots, lidar_data, lidar_mask, car_trans, yaw_pitch_roll, map_prior):
+    def _encode_camera_branch(self, img, trans, rots, intrins, post_trans, post_rots, lidar_data, lidar_mask, car_trans, yaw_pitch_roll):
         x = self.get_cam_feats(img)
         x = self.view_fusion(x)
         Ks, RTs, post_RTs = self.get_Ks_RTs_and_post_RTs(intrins, rots, trans, post_rots, post_trans)
         topdown = self.ipm(x, Ks, RTs, car_trans, yaw_pitch_roll, post_RTs)
         topdown = self.up_sampler(topdown)
-        prior_features = self.prior_map_encoder(map_prior)
         if self.lidar:
             lidar_feature = self.pp(lidar_data, lidar_mask)
             topdown = torch.cat([topdown, lidar_feature], dim=1)
+        return topdown
+
+    def _build_branch_features(self, camera_branch_feature, map_prior, branch_mode):
+        if branch_mode == BRANCH_MODE_CAMERA_ONLY:
+            return {
+                'camera_branch_feature': camera_branch_feature,
+                'satellite_branch_feature': None,
+                'fusion_feature': camera_branch_feature,
+            }
+
+        if branch_mode == BRANCH_MODE_SAT_ONLY:
+            prior_features = self.prior_map_encoder(map_prior)
+            return {
+                'camera_branch_feature': None,
+                'satellite_branch_feature': prior_features,
+                'fusion_feature': prior_features,
+            }
+
+        if branch_mode == BRANCH_MODE_DROP_SATELLITE:
+            satellite_branch_feature = camera_branch_feature.new_zeros(
+                camera_branch_feature.shape[0],
+                self.priormapC,
+                camera_branch_feature.shape[2],
+                camera_branch_feature.shape[3],
+            )
+            fusion_feature = torch.cat([camera_branch_feature, satellite_branch_feature], dim=1)
+            return {
+                'camera_branch_feature': camera_branch_feature,
+                'satellite_branch_feature': satellite_branch_feature,
+                'fusion_feature': fusion_feature,
+            }
+
+        if branch_mode == BRANCH_MODE_DROP_CAMERA:
+            prior_features = self.prior_map_encoder(map_prior)
+            camera_branch_placeholder = prior_features.new_zeros(
+                prior_features.shape[0],
+                self.camera_feature_channels,
+                prior_features.shape[2],
+                prior_features.shape[3],
+            )
+            fusion_feature = torch.cat([camera_branch_placeholder, prior_features], dim=1)
+            return {
+                'camera_branch_feature': camera_branch_placeholder,
+                'satellite_branch_feature': prior_features,
+                'fusion_feature': fusion_feature,
+            }
+
+        prior_features = self.prior_map_encoder(map_prior)
         if self.fusion_mode in ['seg-masked-atten']:
             segmentation = self.seg(map_prior)
-            topdown = self.fusion(topdown, prior_features, segmentation)
+            fusion_feature = self.fusion(camera_branch_feature, prior_features, segmentation)
         else:
-            topdown = self.fusion(topdown, prior_features)
-        return self.bevencode(topdown)
+            fusion_feature = self.fusion(camera_branch_feature, prior_features)
+        return {
+            'camera_branch_feature': camera_branch_feature,
+            'satellite_branch_feature': prior_features,
+            'fusion_feature': fusion_feature,
+        }
+
+    def forward(self, img, trans, rots, intrins, post_trans, post_rots, lidar_data, lidar_mask, car_trans, yaw_pitch_roll, map_prior, branch_mode=None, return_branch_features=None):
+        branch_mode = branch_mode or self.branch_mode
+        if return_branch_features is None:
+            return_branch_features = self.return_branch_features
+
+        camera_branch_feature = None
+        if branch_mode not in (BRANCH_MODE_SAT_ONLY, BRANCH_MODE_DROP_CAMERA):
+            camera_branch_feature = self._encode_camera_branch(
+                img, trans, rots, intrins, post_trans, post_rots, lidar_data, lidar_mask, car_trans, yaw_pitch_roll
+            )
+        branch_features = self._build_branch_features(camera_branch_feature, map_prior, branch_mode)
+        if branch_mode == BRANCH_MODE_CAMERA_ONLY:
+            semantic, embedding, direction = self.camera_bevencode(branch_features['fusion_feature'])
+        elif branch_mode == BRANCH_MODE_SAT_ONLY:
+            semantic, embedding, direction = self.satellite_bevencode(branch_features['fusion_feature'])
+        else:
+            semantic, embedding, direction = self.bevencode(branch_features['fusion_feature'])
+
+        if return_branch_features:
+            return {
+                'semantic': semantic,
+                'embedding': embedding,
+                'direction': direction,
+                'branch_mode': branch_mode,
+                **branch_features,
+            }
+        return semantic, embedding, direction
+
+    def get_probe_decoder(self, decoder_type: str):
+        if decoder_type == 'camera':
+            return self.camera_bevencode
+        if decoder_type == 'satellite':
+            return self.satellite_bevencode
+        raise ValueError(f"Unsupported probe decoder type: {decoder_type}")
+
+    def get_probe_encoder_modules(self, decoder_type: str):
+        if decoder_type == 'camera':
+            modules = [self.camencode, self.view_fusion, self.ipm, self.up_sampler]
+            if self.lidar:
+                modules.append(self.pp)
+            return modules
+        if decoder_type == 'satellite':
+            return [self.prior_map_encoder]
+        raise ValueError(f"Unsupported probe decoder type: {decoder_type}")

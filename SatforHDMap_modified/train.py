@@ -1,4 +1,5 @@
 import os
+import copy
 import numpy as np
 import sys
 import logging
@@ -7,17 +8,76 @@ from tensorboardX import SummaryWriter
 import argparse
 
 import torch
+import torch.nn.functional as F
 from torch.optim.lr_scheduler import StepLR
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from loss import SimpleLoss, DiscriminativeLoss
 
-from data.dataset import semantic_dataset, semantic_dataset_dist
+from data.dataset import semantic_dataset, semantic_dataset_dist, semantic_dataset_test
 from data.const import NUM_CLASSES
 from evaluation.iou import get_batch_iou
 from evaluation.angle_diff import calc_angle_diff
 from model import get_model
 from evaluate import onehot_encoding, eval_iou
+from branch_eval import run_full_evaluation
+from decoder_probe import (
+    DECODER_PROBE_SOURCES,
+    configure_decoder_probe_model,
+    get_decoder_probe_trainable_parameters,
+    reset_decoder_probe_parameters,
+    resolve_decoder_probe_config,
+    set_decoder_probe_train_mode,
+    validate_decoder_probe_load_result,
+)
+
+
+def unpack_model_output(model_output):
+    if isinstance(model_output, dict):
+        return model_output['semantic'], model_output['embedding'], model_output['direction'], model_output
+    semantic, embedding, direction = model_output
+    return semantic, embedding, direction, None
+
+
+def compute_distillation_loss(student_output, teacher_output, feature_name, loss_name):
+    student_feature = student_output[feature_name]
+    teacher_feature = teacher_output[feature_name].detach()
+    if loss_name == 'l1':
+        return F.l1_loss(student_feature, teacher_feature)
+    return F.mse_loss(student_feature, teacher_feature)
+
+
+def load_model_checkpoint(model, checkpoint_path, strict=True):
+    state_dict = {k.replace('module.', ''): v for k, v in torch.load(checkpoint_path).items()}
+    return model.load_state_dict(state_dict, strict=strict)
+
+
+def validate_decoder_probe_args(args, probe_config):
+    if args.branch_mode != probe_config.branch_mode:
+        raise ValueError(
+            f"Decoder probe source {args.probe_feature_source} requires branch_mode={probe_config.branch_mode}, "
+            f"got {args.branch_mode}."
+        )
+    if args.probe_encoder_checkpoint == '':
+        raise ValueError("--probe_encoder_checkpoint is required when --train_decoder_only is set.")
+    if args.finetune:
+        raise ValueError("--train_decoder_only cannot be combined with --finetune.")
+    if args.model_root != '' or args.backbone_model != '':
+        raise ValueError("--train_decoder_only manages checkpoint loading itself; do not combine it with --model_root or --backbone_model.")
+    if args.teacher_model_root != '' or args.distill_weight != 0.0:
+        raise ValueError("--train_decoder_only cannot be combined with distillation teacher settings.")
+
+
+def configure_decoder_probe(model, args):
+    if not args.train_decoder_only:
+        return None
+    probe_config = resolve_decoder_probe_config(args.probe_feature_source)
+    validate_decoder_probe_args(args, probe_config)
+    load_result = load_model_checkpoint(model, args.probe_encoder_checkpoint, strict=probe_config.load_strict)
+    validate_decoder_probe_load_result(probe_config, load_result.missing_keys, load_result.unexpected_keys)
+    configure_decoder_probe_model(model, probe_config.decoder_type)
+    reset_decoder_probe_parameters(model, probe_config.decoder_type)
+    return probe_config
 
 
 def write_log(writer, ious, title, counter):
@@ -37,6 +97,7 @@ def write_log(writer, ious, title, counter):
 
 def train(args):
     rank = 0
+    device_id = 0
     if args.multi_gpu:
         dist.init_process_group('nccl')
         rank = dist.get_rank()
@@ -49,8 +110,7 @@ def train(args):
         torch.cuda.empty_cache()
 
     if rank == 0:
-        if not os.path.exists(args.logdir):
-            os.mkdir(args.logdir)
+        os.makedirs(args.logdir, exist_ok=True)
         logging.basicConfig(filename=os.path.join(args.logdir, "results.log"),
                             filemode='w',
                             format='%(asctime)s: %(message)s',
@@ -76,28 +136,33 @@ def train(args):
         train_loader, val_loader, train_sampler, val_sampler = semantic_dataset_dist(args.version, args.dataroot, args.prior_map_root, data_conf, args.bsz, args.nworkers, args.multi_gpu, (args.satellite_img_w, args.satellite_img_h), is_newsplit=args.is_newsplit)
     else:
         train_loader, val_loader = semantic_dataset(args.version, args.dataroot, args.prior_map_root, data_conf, args.bsz,
-                                                args.nworkers, args.multi_gpu, (args.satellite_map_w, args.satellite_map_h), is_newsplit=args.is_newsplit)
+                                                args.nworkers, args.multi_gpu, (args.satellite_img_w, args.satellite_img_h), is_newsplit=args.is_newsplit)
 
     model = get_model(args.model, data_conf, args, args.instance_seg, args.embedding_dim, args.direction_pred, args.angle_class)
+    teacher_model = None
+    probe_config = None
 
-    if args.model_root != '':
-        model.load_state_dict({k.replace('module.', ''): v for k, v in torch.load(args.model_root).items()})
-        # model.load_state_dict(torch.load(args.model_root))
-    if args.backbone_model != '':
-        model_dict = model.state_dict()
-        dict = {k.replace('module.', ''): v for k, v in torch.load(args.backbone_model).items()}
-        dict = {k : v for k, v in dict.items() if any(k.startswith(prefix) for prefix in ['seg', 'prior_map_encoder', 'view_fusion', 'camencode', 'bevencoder'])}
-        model_dict.update(dict)
-        # dict = {k : v for k, v in dict}
-        model.load_state_dict(model_dict)
+    if args.train_decoder_only:
+        probe_config = configure_decoder_probe(model, args)
+    else:
+        if args.model_root != '':
+            load_model_checkpoint(model, args.model_root)
+            # model.load_state_dict(torch.load(args.model_root))
+        if args.backbone_model != '':
+            model_dict = model.state_dict()
+            dict = {k.replace('module.', ''): v for k, v in torch.load(args.backbone_model).items()}
+            dict = {k : v for k, v in dict.items() if any(k.startswith(prefix) for prefix in ['seg', 'prior_map_encoder', 'view_fusion', 'camencode', 'bevencoder'])}
+            model_dict.update(dict)
+            # dict = {k : v for k, v in dict}
+            model.load_state_dict(model_dict)
 
-    if args.finetune:
-        model.load_state_dict(torch.load(args.modelf), strict=False)
-        for name, param in model.named_parameters():
-            if 'bevencode.up' in name or 'bevencode.layer3' in name:
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
+        if args.finetune:
+            model.load_state_dict(torch.load(args.modelf), strict=False)
+            for name, param in model.named_parameters():
+                if 'bevencode.up' in name or 'bevencode.layer3' in name:
+                    param.requires_grad = True
+                else:
+                    param.requires_grad = False
 
     if args.multi_gpu:
         model = model.to(device_id)
@@ -105,7 +170,21 @@ def train(args):
     else:
         model.cuda()
 
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.teacher_model_root != '':
+        teacher_args = copy.deepcopy(args)
+        teacher_args.branch_mode = args.teacher_branch_mode
+        teacher_model = get_model(args.model, data_conf, teacher_args, args.instance_seg, args.embedding_dim, args.direction_pred, args.angle_class)
+        load_model_checkpoint(teacher_model, args.teacher_model_root)
+        if args.multi_gpu:
+            teacher_model = teacher_model.to(device_id)
+        else:
+            teacher_model.cuda()
+        teacher_model.eval()
+
+    if probe_config is not None:
+        opt = torch.optim.Adam(get_decoder_probe_trainable_parameters(model, probe_config.decoder_type), lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     sched = StepLR(opt, 10, 0.1)
     if rank==0:
         writer = SummaryWriter(logdir=args.logdir)
@@ -114,6 +193,8 @@ def train(args):
     embedded_loss_fn = DiscriminativeLoss(args.embedding_dim, args.delta_v, args.delta_d).to(device_id)
     direction_loss_fn = torch.nn.BCELoss(reduction='none').to(device_id)
     model.train()
+    if probe_config is not None:
+        set_decoder_probe_train_mode(model, probe_config.decoder_type)
     counter = 0
     last_idx = len(train_loader) - 1
     for epoch in range(args.nepochs):
@@ -126,10 +207,12 @@ def train(args):
             t0 = time()
             opt.zero_grad()
 
-            semantic, embedding, direction = model(imgs.to(device_id), trans.to(device_id), rots.to(device_id), intrins.to(device_id),
-                                                   post_trans.to(device_id), post_rots.to(device_id), lidar_data.to(device_id),
-                                                   lidar_mask.to(device_id), car_trans.to(device_id), yaw_pitch_roll.to(device_id),
-                                                   prior_map.to(device_id))
+            student_output = model(imgs.to(device_id), trans.to(device_id), rots.to(device_id), intrins.to(device_id),
+                                   post_trans.to(device_id), post_rots.to(device_id), lidar_data.to(device_id),
+                                   lidar_mask.to(device_id), car_trans.to(device_id), yaw_pitch_roll.to(device_id),
+                                   prior_map.to(device_id), branch_mode=args.branch_mode,
+                                   return_branch_features=args.return_branch_features or teacher_model is not None)
+            semantic, embedding, direction, student_features = unpack_model_output(student_output)
 
             semantic_gt = semantic_gt.cuda().float()
             instance_gt = instance_gt.cuda()
@@ -151,7 +234,22 @@ def train(args):
                 direction_loss = 0
                 angle_diff = 0
 
-            final_loss = seg_loss * args.scale_seg + var_loss * args.scale_var + dist_loss * args.scale_dist + direction_loss * args.scale_direction
+            distillation_loss = semantic.new_tensor(0.0)
+            if teacher_model is not None:
+                with torch.no_grad():
+                    teacher_output = teacher_model(imgs.to(device_id), trans.to(device_id), rots.to(device_id), intrins.to(device_id),
+                                                   post_trans.to(device_id), post_rots.to(device_id), lidar_data.to(device_id),
+                                                   lidar_mask.to(device_id), car_trans.to(device_id), yaw_pitch_roll.to(device_id),
+                                                   prior_map.to(device_id), branch_mode=args.teacher_branch_mode, return_branch_features=True)
+                _, _, _, teacher_features = unpack_model_output(teacher_output)
+                distillation_loss = compute_distillation_loss(
+                    student_features,
+                    teacher_features,
+                    args.distill_feature,
+                    args.distill_loss,
+                )
+
+            final_loss = seg_loss * args.scale_seg + var_loss * args.scale_var + dist_loss * args.scale_dist + direction_loss * args.scale_direction + distillation_loss * args.distill_weight
             final_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             opt.step()
@@ -173,6 +271,7 @@ def train(args):
                 writer.add_scalar('train/dist_loss', dist_loss, counter)
                 writer.add_scalar('train/reg_loss', reg_loss, counter)
                 writer.add_scalar('train/direction_loss', direction_loss, counter)
+                writer.add_scalar('train/distillation_loss', distillation_loss, counter)
                 writer.add_scalar('train/final_loss', final_loss, counter)
                 writer.add_scalar('train/angle_diff', angle_diff, counter)
 
@@ -182,11 +281,27 @@ def train(args):
                         f"IOU: {np.array2string(iou[1:].numpy(), precision=3, floatmode='fixed')}")
 
             write_log(writer, iou, 'eval', counter)
-            model_name = os.path.join(args.logdir, f"model{epoch}.pt")
-            torch.save(model.module.state_dict(), model_name)
-            logger.info(f"{model_name} saved")
         model.train()
+        if probe_config is not None:
+            set_decoder_probe_train_mode(model, probe_config.decoder_type)
         sched.step()
+
+    if rank == 0:
+        final_state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+        final_model_path = os.path.join(args.logdir, "model_last.pt")
+        torch.save(final_state_dict, final_model_path)
+        logger.info(f"{final_model_path} saved")
+        final_test_loader = semantic_dataset_test(
+            args.version,
+            args.dataroot,
+            args.prior_map_root,
+            data_conf,
+            args.bsz,
+            args.nworkers,
+            is_newsplit=args.is_newsplit,
+        )
+        eval_model = model.module if hasattr(model, 'module') else model
+        run_full_evaluation(eval_model, final_test_loader, args, logger=logger)
     # cleanup()
 
 
@@ -201,10 +316,13 @@ if __name__ == '__main__':
     # fusion mode config
     # parser.add_argument("--fusion_mode", type=str, default="concat", choices=['concat', 'swin-atten', 'atten', 'new-atten', 'deform-atten', 'masked-atten', 'masked-atten-seg', 'new-atten-masked', 'new-atten-masked-seg', 'new-deform-t'])
     parser.add_argument("--fusion_mode", type=str, default='seg-masked-atten', choices=['attention', 'swin-atten', 'deform-atten', 'masked-atten', 'seg-masked-atten'])
+    parser.add_argument("--branch_mode", type=str, default='fusion', choices=['camera_only', 'sat_only', 'fusion', 'drop_satellite', 'drop_camera'])
     parser.add_argument('--align_fusion', action='store_true')
 
     # logging config
     parser.add_argument("--logdir", type=str, default='./runs/original')
+    parser.add_argument("--experiment_name", type=str, default='fusion_base')
+    parser.add_argument("--return_branch_features", action='store_true')
 
     # nuScenes config
     #parser.add_argument('--dataroot', type=str, default='./dataset/nuScenes_mini')
@@ -233,6 +351,14 @@ if __name__ == '__main__':
     # checkpoint config
     parser.add_argument('--model_root', type=str, default='')
     parser.add_argument('--backbone_model', type=str, default='')
+    parser.add_argument('--teacher_model_root', type=str, default='')
+    parser.add_argument('--teacher_branch_mode', type=str, default='camera_only', choices=['camera_only', 'sat_only'])
+    parser.add_argument('--distill_feature', type=str, default='camera_branch_feature', choices=['camera_branch_feature', 'satellite_branch_feature', 'fusion_feature'])
+    parser.add_argument('--distill_loss', type=str, default='mse', choices=['mse', 'l1'])
+    parser.add_argument('--distill_weight', type=float, default=0.0)
+    parser.add_argument('--train_decoder_only', action='store_true')
+    parser.add_argument('--probe_feature_source', type=str, default='', choices=[''] + list(DECODER_PROBE_SOURCES))
+    parser.add_argument('--probe_encoder_checkpoint', type=str, default='')
 
     # data config
     parser.add_argument("--thickness", type=int, default=5)

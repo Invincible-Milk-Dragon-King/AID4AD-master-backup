@@ -13,6 +13,15 @@ from .base_mapper import BaseMapper, MAPPERS
 from copy import deepcopy
 from ..utils.memory_buffer import StreamTensorMemory
 from mmcv.cnn.utils import constant_init, kaiming_init
+from .branch_protocol import (
+    BRANCH_MODE_CAMERA_ONLY,
+    BRANCH_MODE_FUSION,
+    BRANCH_MODE_DROP_SATELLITE,
+    BRANCH_MODE_SATELLITE_ONLY,
+    resolve_branch_mode,
+    uses_aerial_encoder,
+    uses_aerial_fuser,
+)
 
 @MAPPERS.register_module()
 class StreamMapNet(BaseMapper):
@@ -29,6 +38,9 @@ class StreamMapNet(BaseMapper):
                  pretrained=None,
                  use_AID4AD=False,
                  AID4AD_only=False,
+                 branch_mode=None,
+                 return_branch_features=False,
+                 distill_cfg=None,
                  **kwargs):
         super().__init__()
 
@@ -38,7 +50,17 @@ class StreamMapNet(BaseMapper):
   
         self.backbone = build_backbone(backbone_cfg)
 
-        self.use_AID4AD = use_AID4AD
+        self.branch_mode = resolve_branch_mode(use_AID4AD, AID4AD_only, branch_mode)
+        self.return_branch_features = return_branch_features
+        self.distill_cfg = distill_cfg or {}
+        self.distill_feature = self.distill_cfg.get('feature_name', 'camera_branch_feature')
+        self.distill_loss = self.distill_cfg.get('loss_name', 'mse')
+        self.distill_weight = self.distill_cfg.get('loss_weight', 0.0)
+        self.teacher_branch_mode = self.distill_cfg.get('teacher_branch_mode', BRANCH_MODE_CAMERA_ONLY)
+        self.teacher_ckpt = self.distill_cfg.get('teacher_ckpt')
+        self.teacher_model = None
+
+        self.use_AID4AD = use_AID4AD or self.branch_mode in (BRANCH_MODE_FUSION, BRANCH_MODE_SATELLITE_ONLY)
         self.AID4AD_only = AID4AD_only
 
         if not self.use_AID4AD and self.AID4AD_only:
@@ -89,6 +111,19 @@ class StreamMapNet(BaseMapper):
             self.register_buffer('plane', plane.double())
         
         self.init_weights(pretrained)
+        if self.teacher_ckpt:
+            self.teacher_model = self._build_teacher_model(
+                bev_h=bev_h,
+                bev_w=bev_w,
+                roi_size=roi_size,
+                backbone_cfg=backbone_cfg,
+                head_cfg=head_cfg,
+                neck_cfg=neck_cfg,
+                model_name=model_name,
+                streaming_cfg=streaming_cfg,
+                use_AID4AD=use_AID4AD,
+                AID4AD_only=False,
+            )
 
     def init_weights(self, pretrained=None):
         """Initialize model weights."""
@@ -104,6 +139,64 @@ class StreamMapNet(BaseMapper):
                 pass
             if self.streaming_bev:
                 self.stream_fusion_neck.init_weights()
+
+    def _build_teacher_model(self, bev_h, bev_w, roi_size, backbone_cfg, head_cfg, neck_cfg, model_name, streaming_cfg, use_AID4AD, AID4AD_only):
+        from mmcv.runner import load_checkpoint
+
+        teacher_model = type(self)(
+            bev_h=bev_h,
+            bev_w=bev_w,
+            roi_size=roi_size,
+            backbone_cfg=deepcopy(backbone_cfg),
+            head_cfg=deepcopy(head_cfg),
+            neck_cfg=deepcopy(neck_cfg),
+            model_name=model_name,
+            streaming_cfg=deepcopy(streaming_cfg),
+            pretrained=None,
+            use_AID4AD=use_AID4AD,
+            AID4AD_only=AID4AD_only,
+            branch_mode=self.teacher_branch_mode,
+            return_branch_features=True,
+            distill_cfg=None,
+        )
+        load_checkpoint(teacher_model, self.teacher_ckpt, strict=False, logger=None)
+        teacher_model.eval()
+        for parameter in teacher_model.parameters():
+            parameter.requires_grad = False
+        return teacher_model
+
+    def extract_branch_features(self, img, aerial_img=None, points=None, img_metas=None, branch_mode=None):
+        branch_mode = branch_mode or self.branch_mode
+
+        camera_branch_feature = None
+        if branch_mode != BRANCH_MODE_SATELLITE_ONLY:
+            camera_branch_feature = self.backbone(img, img_metas=img_metas, points=points)
+
+        satellite_branch_feature = None
+        if uses_aerial_encoder(branch_mode):
+            satellite_branch_feature = self.aid_encoder(aerial_img)
+            satellite_branch_feature = self.aid_downsampler(satellite_branch_feature)
+
+        if branch_mode == BRANCH_MODE_SATELLITE_ONLY:
+            fusion_feature = satellite_branch_feature
+        elif uses_aerial_fuser(branch_mode):
+            fusion_feature = self.aid_fuser(torch.cat([camera_branch_feature, satellite_branch_feature], dim=1))
+        else:
+            fusion_feature = camera_branch_feature
+            if branch_mode == BRANCH_MODE_DROP_SATELLITE:
+                satellite_branch_feature = torch.zeros_like(camera_branch_feature)
+
+        return {
+            'branch_mode': branch_mode,
+            'camera_branch_feature': camera_branch_feature,
+            'satellite_branch_feature': satellite_branch_feature,
+            'fusion_feature': fusion_feature,
+        }
+
+    def _compute_distillation_loss(self, student_feature, teacher_feature):
+        if self.distill_loss == 'l1':
+            return F.l1_loss(student_feature, teacher_feature.detach())
+        return F.mse_loss(student_feature, teacher_feature.detach())
 
     def update_bev_feature(self, curr_bev_feats, img_metas):
         '''
@@ -187,15 +280,14 @@ class StreamMapNet(BaseMapper):
         bs = img.shape[0]
 
         # Backbone
-        _bev_feats = self.backbone(img, img_metas=img_metas, points=points)
-
-        if self.use_AID4AD:
-            _aid_feats = self.aid_encoder(aerial_img)                                       # [bs, 64, 200, 400]
-            _aid_feats = self.aid_downsampler(_aid_feats)                                   # [bs, 256, 50, 100]
-            if self.AID4AD_only:
-                _bev_feats = _aid_feats
-            else:
-                _bev_feats = self.aid_fuser(torch.cat([_bev_feats, _aid_feats], dim=1))          # [bs, 256, 50, 100]
+        branch_features = self.extract_branch_features(
+            img,
+            aerial_img=aerial_img,
+            points=points,
+            img_metas=img_metas,
+        )
+        self.latest_branch_features = branch_features
+        _bev_feats = branch_features['fusion_feature']
         
         if self.streaming_bev:
             self.bev_memory.train()
@@ -214,6 +306,23 @@ class StreamMapNet(BaseMapper):
         loss = 0
         for name, var in loss_dict.items():
             loss = loss + var
+
+        if self.teacher_model is not None and branch_features.get(self.distill_feature) is not None:
+            with torch.no_grad():
+                teacher_branch_features = self.teacher_model.extract_branch_features(
+                    img,
+                    aerial_img=aerial_img,
+                    points=points,
+                    img_metas=img_metas,
+                    branch_mode=self.teacher_branch_mode,
+                )
+            distill_loss = self._compute_distillation_loss(
+                branch_features[self.distill_feature],
+                teacher_branch_features[self.distill_feature],
+            )
+            distill_term = distill_loss * self.distill_weight
+            loss = loss + distill_term
+            loss_dict['distill_loss'] = distill_term
 
         # update the log
         log_vars = {k: v.item() for k, v in loss_dict.items()}
@@ -235,15 +344,14 @@ class StreamMapNet(BaseMapper):
         for img_meta in img_metas:
             tokens.append(img_meta['token'])
 
-        _bev_feats = self.backbone(img, img_metas, points=points)
-
-        if self.use_AID4AD:
-            _aid_feats = self.aid_encoder(aerial_img)                                    # [bs, 64, 200, 400]
-            _aid_feats = self.aid_downsampler(_aid_feats)                                   # [bs, 256, 50, 100]
-            if self.AID4AD_only:
-                _bev_feats = _aid_feats
-            else:
-                _bev_feats = self.aid_fuser(torch.cat([_bev_feats, _aid_feats], dim=1))          # [bs, 256, 50, 100]
+        branch_features = self.extract_branch_features(
+            img,
+            aerial_img=aerial_img,
+            points=points,
+            img_metas=img_metas,
+        )
+        self.latest_branch_features = branch_features
+        _bev_feats = branch_features['fusion_feature']
 
         img_shape = [_bev_feats.shape[2:] for i in range(_bev_feats.shape[0])]
 
@@ -305,9 +413,13 @@ class StreamMapNet(BaseMapper):
         super().train(*args, **kwargs)
         if self.streaming_bev:
             self.bev_memory.train(*args, **kwargs)
+        if self.teacher_model is not None:
+            self.teacher_model.eval()
     
     def eval(self):
         super().eval()
         if self.streaming_bev:
             self.bev_memory.eval()
+        if self.teacher_model is not None:
+            self.teacher_model.eval()
 

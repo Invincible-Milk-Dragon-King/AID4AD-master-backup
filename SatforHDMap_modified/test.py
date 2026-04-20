@@ -8,43 +8,16 @@ import torch
 import numpy as np
 from data.dataset import semantic_dataset_test
 from data.const import NUM_CLASSES
-from evaluation.iou import get_batch_iou
-from postprocess.vectorize import vectorize
 from model import get_model
+from branch_eval import run_full_evaluation
 
 
 SAMPLED_RECALLS = torch.linspace(0.1, 1, 10)
 THRESHOLDS = [2, 4, 6]
 
-
-def onehot_encoding(logits, dim=1):
-    max_idx = torch.argmax(logits, dim, keepdim=True)
-    one_hot = logits.new_full(logits.shape, 0)
-    one_hot.scatter_(dim, max_idx, 1)
-    return one_hot
-
-
-def test_iou(model, test_loader):
-    model.eval()
-    total_intersects = 0
-    total_union = 0
-    with torch.no_grad():
-        for imgs, trans, rots, intrins, post_trans, post_rots, lidar_data, lidar_mask, car_trans, yaw_pitch_roll, semantic_gt, instance_gt, direction_gt, prior_map in tqdm.tqdm(test_loader):
-            semantic, embedding, direction = model(imgs.cuda(), trans.cuda(), rots.cuda(), intrins.cuda(),
-                                                post_trans.cuda(), post_rots.cuda(), lidar_data.cuda(),
-                                                lidar_mask.cuda(), car_trans.cuda(), yaw_pitch_roll.cuda(),
-                                                prior_map.cuda())
-            semantic_gt = semantic_gt.cuda().float()
-            intersects, union = get_batch_iou(onehot_encoding(semantic), semantic_gt)
-            total_intersects += intersects
-            total_union += union
-    return total_intersects / (total_union + 1e-7)
-
-
 def main(args):
-    if not os.path.exists(args.logdir):
-        os.mkdir(args.logdir)
-    logfile = os.path.join(args.logdir, "{}_{}_{}".format(args.fusion_mode, args.version.split('-')[-1], os.path.split(args.modelf)[-1].split('.')[0]))
+    os.makedirs(args.logdir, exist_ok=True)
+    logfile = os.path.join(args.logdir, "{}_{}_{}_{}".format(args.experiment_name, args.branch_mode, args.version.split('-')[-1], os.path.split(args.modelf)[-1].split('.')[0]))
     logging.basicConfig(filename=logfile,
                         filemode='w',
                         format='%(asctime)s: %(message)s',
@@ -72,8 +45,10 @@ def main(args):
 
     # model.load_state_dict(torch.load(args.modelf), strict=False)
     model.cuda()
-    iou = test_iou(model, test_loader)
-    logger.info(f"IOU: {np.array2string(iou[1:].numpy(), precision=3, floatmode='fixed')}")
+    results = run_full_evaluation(model, test_loader, args, logger=logger)
+    logger.info(f"IOU: {np.array2string(results['iou'][1:].numpy(), precision=3, floatmode='fixed')}")
+    logger.info(f"mIoU: {results['miou']:.4f}")
+    logger.info(f"mAP: {results['map']:.4f}")
 
 
 if __name__ == '__main__':
@@ -82,7 +57,10 @@ if __name__ == '__main__':
     parser.add_argument("--is_newsplit", action='store_true')
     parser.add_argument("--local_rank", "--local-rank", dest="local_rank", type=int, default=0)
     parser.add_argument("--fusion_mode", type=str, default='seg-masked-atten', choices=['attention', 'swin-atten', 'deform-atten', 'masked-atten', 'seg-masked-atten'])
+    parser.add_argument("--branch_mode", type=str, default='fusion', choices=['camera_only', 'sat_only', 'fusion', 'drop_satellite', 'drop_camera'])
     parser.add_argument("--align_fusion", action='store_true')
+    parser.add_argument("--experiment_name", type=str, default='fusion_base')
+    parser.add_argument("--return_branch_features", action='store_true')
     parser.add_argument('--satellite_img_h', type=int, default=200)
     parser.add_argument('--satellite_img_w', type=int, default=400)
     parser.add_argument("--logdir", type=str, default='./test_log')

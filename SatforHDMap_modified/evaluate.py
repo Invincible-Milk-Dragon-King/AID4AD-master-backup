@@ -23,10 +23,14 @@ def eval_iou(model, val_loader):
     with torch.no_grad():
         for imgs, trans, rots, intrins, post_trans, post_rots, lidar_data, lidar_mask, car_trans, yaw_pitch_roll, semantic_gt, instance_gt, direction_gt, prior_map in tqdm.tqdm(val_loader):
 
-            semantic, embedding, direction = model(imgs.cuda(), trans.cuda(), rots.cuda(), intrins.cuda(),
-                                                post_trans.cuda(), post_rots.cuda(), lidar_data.cuda(),
-                                                lidar_mask.cuda(), car_trans.cuda(), yaw_pitch_roll.cuda(),
-                                                prior_map.cuda())
+            model_output = model(imgs.cuda(), trans.cuda(), rots.cuda(), intrins.cuda(),
+                                 post_trans.cuda(), post_rots.cuda(), lidar_data.cuda(),
+                                 lidar_mask.cuda(), car_trans.cuda(), yaw_pitch_roll.cuda(),
+                                 prior_map.cuda())
+            if isinstance(model_output, dict):
+                semantic = model_output['semantic']
+            else:
+                semantic, _, _ = model_output
 
             semantic_gt = semantic_gt.cuda().float()
             intersects, union = get_batch_iou(onehot_encoding(semantic), semantic_gt)
