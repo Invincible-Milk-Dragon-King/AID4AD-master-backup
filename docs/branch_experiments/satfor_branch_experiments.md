@@ -49,6 +49,12 @@ All experiment outputs are stored under:
 
 `SatforHDMap_modified/branch_runs/<experiment_name>/`
 
+All AP / mAP calculations now default to:
+
+- `MAP_THRESHOLDS=0.2 0.5 1.0`
+
+This applies to training-time final evaluation, standalone `test.py` evaluation scripts, and `eval_vectors_paper_ap.sh`.
+
 Each training experiment writes:
 
 - `results.log`

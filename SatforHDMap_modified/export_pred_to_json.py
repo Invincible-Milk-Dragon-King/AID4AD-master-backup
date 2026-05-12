@@ -31,10 +31,36 @@ def export_to_json(model, val_loader, angle_class, args):
 
     model.eval()
     with torch.no_grad():
-        for batchi, (imgs, trans, rots, intrins, post_trans, post_rots, lidar_data, lidar_mask, car_trans, yaw_pitch_roll, segmentation_gt, instance_gt, direction_gt) in enumerate(tqdm.tqdm(val_loader)):
-            segmentation, embedding, direction = model(imgs.cuda(), trans.cuda(), rots.cuda(), intrins.cuda(),
-                                                       post_trans.cuda(), post_rots.cuda(), lidar_data.cuda(),
-                                                       lidar_mask.cuda(), car_trans.cuda(), yaw_pitch_roll.cuda())
+        for batchi, (
+            imgs,
+            trans,
+            rots,
+            intrins,
+            post_trans,
+            post_rots,
+            lidar_data,
+            lidar_mask,
+            car_trans,
+            yaw_pitch_roll,
+            segmentation_gt,
+            instance_gt,
+            direction_gt,
+            prior_map,
+        ) in enumerate(tqdm.tqdm(val_loader)):
+            segmentation, embedding, direction = model(
+                imgs.cuda(),
+                trans.cuda(),
+                rots.cuda(),
+                intrins.cuda(),
+                post_trans.cuda(),
+                post_rots.cuda(),
+                lidar_data.cuda(),
+                lidar_mask.cuda(),
+                car_trans.cuda(),
+                yaw_pitch_roll.cuda(),
+                prior_map.cuda(),
+                branch_mode=args.branch_mode,
+            )
 
             for si in range(segmentation.shape[0]):
                 coords, confidences, line_types = vectorize(segmentation[si], embedding[si], direction[si], angle_class)
@@ -60,8 +86,18 @@ def main(args):
         'angle_class': args.angle_class,
     }
 
-    train_loader, val_loader = semantic_dataset(args.version, args.dataroot, data_conf, args.bsz, args.nworkers)
-    model = get_model(args.model, data_conf, True, args.embedding_dim, True, args.angle_class)
+    train_loader, val_loader = semantic_dataset(
+        args.version,
+        args.dataroot,
+        args.prior_map_root,
+        data_conf,
+        args.bsz,
+        args.nworkers,
+        False,
+        (args.satellite_img_w, args.satellite_img_h),
+        is_newsplit=args.is_newsplit,
+    )
+    model = get_model(args.model, data_conf, args, True, args.embedding_dim, True, args.angle_class)
     model.load_state_dict(torch.load(args.modelf), strict=False)
     model.cuda()
     export_to_json(model, val_loader, args.angle_class, args)
@@ -70,11 +106,20 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # nuScenes config
+    parser.add_argument("--is_newsplit", action='store_true')
     parser.add_argument('--dataroot', type=str, default='dataset/nuScenes/')
+    parser.add_argument('--prior_map_root', type=str, default='./satmap/satellite_map_trainval')
     parser.add_argument('--version', type=str, default='v1.0-mini', choices=['v1.0-trainval', 'v1.0-mini'])
 
     # model config
     parser.add_argument("--model", type=str, default='HDMapNet_cam')
+    parser.add_argument("--fusion_mode", type=str, default='seg-masked-atten', choices=['attention', 'swin-atten', 'deform-atten', 'masked-atten', 'seg-masked-atten'])
+    parser.add_argument("--branch_mode", type=str, default='camera_only', choices=['camera_only', 'sat_only', 'fusion', 'drop_satellite', 'drop_camera'])
+    parser.add_argument('--align_fusion', action='store_true')
+    parser.add_argument("--return_branch_features", action='store_true')
+    parser.add_argument('--satellite_img_h', type=int, default=200)
+    parser.add_argument('--satellite_img_w', type=int, default=400)
+    parser.add_argument("--local_rank", "--local-rank", dest="local_rank", type=int, default=0)
 
     # training config
     parser.add_argument("--bsz", type=int, default=4)

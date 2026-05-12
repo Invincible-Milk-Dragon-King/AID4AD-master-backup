@@ -10,9 +10,28 @@ from nuscenes.utils.splits import create_splits_scenes
 
 
 class HDMapNetEvalDataset(HDMapNetDataset):
-    def __init__(self, version, dataroot, eval_set, result_path, data_conf, max_line_count=300):
+    def __init__(
+        self,
+        version,
+        dataroot,
+        eval_set,
+        result_path,
+        data_conf,
+        prior_map_root,
+        satellite_map_size=(400, 200),
+        max_line_count=300,
+        is_newsplit=False,
+    ):
         self.eval_set = eval_set
-        super(HDMapNetEvalDataset, self).__init__(version, dataroot, data_conf, is_train=False)
+        super(HDMapNetEvalDataset, self).__init__(
+            version,
+            dataroot,
+            prior_map_root,
+            data_conf,
+            is_train=False,
+            satellite_map_size=satellite_map_size,
+            is_newsplit=is_newsplit,
+        )
         with open(result_path, 'r') as f:
             self.prediction = json.load(f)
         self.max_line_count = max_line_count

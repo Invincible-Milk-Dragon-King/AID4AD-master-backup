@@ -25,11 +25,26 @@ from decoder_probe import (
     DECODER_PROBE_SOURCES,
     configure_decoder_probe_model,
     get_decoder_probe_trainable_parameters,
+    normalize_legacy_camera_state_dict,
     reset_decoder_probe_parameters,
     resolve_decoder_probe_config,
     set_decoder_probe_train_mode,
     validate_decoder_probe_load_result,
 )
+
+
+PAPER_MAP_THRESHOLDS = [0.2, 0.5, 1.0]
+
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in ('yes', 'true', 't', '1', 'y'):
+        return True
+    if value in ('no', 'false', 'f', '0', 'n'):
+        return False
+    raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
 def unpack_model_output(model_output):
@@ -40,8 +55,11 @@ def unpack_model_output(model_output):
 
 
 def compute_distillation_loss(student_output, teacher_output, feature_name, loss_name):
-    student_feature = student_output[feature_name]
     teacher_feature = teacher_output[feature_name].detach()
+    scale_dims = tuple(range(1, teacher_feature.ndim))
+    teacher_scale = teacher_feature.pow(2).mean(dim=scale_dims, keepdim=True).sqrt().clamp_min(1.0)
+    student_feature = student_output[feature_name] / teacher_scale
+    teacher_feature = teacher_feature / teacher_scale
     if loss_name == 'l1':
         return F.l1_loss(student_feature, teacher_feature)
     return F.mse_loss(student_feature, teacher_feature)
@@ -49,7 +67,8 @@ def compute_distillation_loss(student_output, teacher_output, feature_name, loss
 
 def load_model_checkpoint(model, checkpoint_path, strict=True):
     state_dict = {k.replace('module.', ''): v for k, v in torch.load(checkpoint_path).items()}
-    return model.load_state_dict(state_dict, strict=strict)
+    state_dict, is_legacy_camera = normalize_legacy_camera_state_dict(state_dict, model.state_dict())
+    return model.load_state_dict(state_dict, strict=strict and not is_legacy_camera)
 
 
 def validate_decoder_probe_args(args, probe_config):
@@ -106,7 +125,7 @@ def train(args):
         print(f'current rank:{rank}')
         device_id = rank % torch.cuda.device_count()
 
-        torch.cuda.set_device(rank)
+        torch.cuda.set_device(device_id)
         torch.cuda.empty_cache()
 
     if rank == 0:
@@ -259,10 +278,15 @@ def train(args):
             if counter % 10 == 0 and rank == 0:
                 intersects, union = get_batch_iou(onehot_encoding(semantic), semantic_gt)
                 iou = intersects / (union + 1e-7)
-                logger.info(f"TRAIN[{epoch:>3d}]: [{batchi:>4d}/{last_idx}]    "
-                            f"Time: {t1-t0:>7.4f}    "
-                            f"Loss: {final_loss.item():>7.4f}    "
-                            f"IOU: {np.array2string(iou[1:].numpy(), precision=3, floatmode='fixed')}")
+                loss_message = (
+                    f"TRAIN[{epoch:>3d}]: [{batchi:>4d}/{last_idx}]    "
+                    f"Time: {t1-t0:>7.4f}    "
+                    f"Loss: {final_loss.item():>7.4f}    "
+                )
+                if teacher_model is not None:
+                    loss_message += f"Distill: {distillation_loss.item():>7.4f}    "
+                loss_message += f"IOU: {np.array2string(iou[1:].numpy(), precision=3, floatmode='fixed')}"
+                logger.info(loss_message)
 
                 write_log(writer, iou, 'train', counter)
                 writer.add_scalar('train/step_time', t1 - t0, counter)
@@ -310,13 +334,14 @@ if __name__ == '__main__':
 
     parser.add_argument('--is_newsplit', action='store_true')
     # multi_gpu config
-    parser.add_argument("--multi_gpu", type=bool, default=True)
+    parser.add_argument("--multi_gpu", type=str2bool, nargs='?', const=True, default=True)
     parser.add_argument("--local_rank", "--local-rank", dest="local_rank", type=int, default=0)
 
     # fusion mode config
     # parser.add_argument("--fusion_mode", type=str, default="concat", choices=['concat', 'swin-atten', 'atten', 'new-atten', 'deform-atten', 'masked-atten', 'masked-atten-seg', 'new-atten-masked', 'new-atten-masked-seg', 'new-deform-t'])
     parser.add_argument("--fusion_mode", type=str, default='seg-masked-atten', choices=['attention', 'swin-atten', 'deform-atten', 'masked-atten', 'seg-masked-atten'])
     parser.add_argument("--branch_mode", type=str, default='fusion', choices=['camera_only', 'sat_only', 'fusion', 'drop_satellite', 'drop_camera'])
+    parser.add_argument("--map_thresholds", nargs="+", type=float, default=PAPER_MAP_THRESHOLDS)
     parser.add_argument('--align_fusion', action='store_true')
 
     # logging config

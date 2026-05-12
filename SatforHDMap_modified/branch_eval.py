@@ -12,6 +12,10 @@ from evaluate_json import SAMPLED_RECALLS, THRESHOLDS
 from postprocess.vectorize import vectorize
 
 
+def get_map_thresholds(args):
+    return getattr(args, "map_thresholds", None) or THRESHOLDS
+
+
 def gen_dx_bx(xbound, ybound):
     dx = [row[2] for row in [xbound, ybound]]
     bx = [row[0] + row[2] / 2.0 for row in [xbound, ybound]]
@@ -73,7 +77,8 @@ def _onehot_encoding(logits, dim=1):
     return one_hot
 
 
-def export_predictions_and_compute_map(model, test_loader, args):
+def export_predictions_and_compute_map(model, test_loader, args, extra_metrics=None):
+    map_thresholds = get_map_thresholds(args)
     patch_h = args.ybound[1] - args.ybound[0]
     patch_w = args.xbound[1] - args.xbound[0]
     canvas_h = int(patch_h / args.ybound[2])
@@ -95,8 +100,8 @@ def export_predictions_and_compute_map(model, test_loader, args):
 
     total_intersect = torch.zeros(NUM_CLASSES, device="cuda")
     total_union = torch.zeros(NUM_CLASSES, device="cuda")
-    ap_matrix = torch.zeros((NUM_CLASSES, len(THRESHOLDS)), device="cuda")
-    ap_count_matrix = torch.zeros((NUM_CLASSES, len(THRESHOLDS)), device="cuda")
+    ap_matrix = torch.zeros((NUM_CLASSES, len(map_thresholds)), device="cuda")
+    ap_count_matrix = torch.zeros((NUM_CLASSES, len(map_thresholds)), device="cuda")
 
     model.eval()
     with torch.no_grad():
@@ -163,7 +168,7 @@ def export_predictions_and_compute_map(model, test_loader, args):
                     args.xbound[2],
                     args.ybound[2],
                     confidence_tensor,
-                    THRESHOLDS,
+                    map_thresholds,
                     sampled_recalls=SAMPLED_RECALLS,
                 )
 
@@ -182,19 +187,28 @@ def export_predictions_and_compute_map(model, test_loader, args):
     with open(result_json_path, "w") as handle:
         json.dump(submission, handle)
     with open(metrics_json_path, "w") as handle:
+        metrics = {
+            "raster_iou": raster_iou,
+            "map": map_value,
+            "average_precision_matrix": average_precision.detach().cpu().tolist(),
+            "map_thresholds": map_thresholds,
+            "sampled_recalls": SAMPLED_RECALLS.detach().cpu().tolist(),
+        }
+        if extra_metrics is not None:
+            metrics.update(extra_metrics)
         json.dump(
-            {
-                "raster_iou": raster_iou,
-                "map": map_value,
-                "average_precision_matrix": average_precision.detach().cpu().tolist(),
-            },
+            metrics,
             handle,
             indent=2,
         )
 
+    average_precision_matrix = average_precision.detach().cpu().tolist()
     return {
         "raster_iou": raster_iou,
         "map": map_value,
+        "average_precision_matrix": average_precision_matrix,
+        "map_thresholds": map_thresholds,
+        "sampled_recalls": SAMPLED_RECALLS.detach().cpu().tolist(),
         "result_json_path": result_json_path,
         "metrics_json_path": metrics_json_path,
     }
@@ -202,17 +216,7 @@ def export_predictions_and_compute_map(model, test_loader, args):
 
 def run_full_evaluation(model, test_loader, args, logger=None):
     iou, miou = evaluate_semantic_iou(model, test_loader, args)
-    map_metrics = export_predictions_and_compute_map(model, test_loader, args)
-    with open(map_metrics['metrics_json_path'], "w") as handle:
-        json.dump(
-            {
-                "miou": miou,
-                "map": map_metrics['map'],
-                "raster_iou": map_metrics['raster_iou'],
-            },
-            handle,
-            indent=2,
-        )
+    map_metrics = export_predictions_and_compute_map(model, test_loader, args, extra_metrics={"miou": miou})
     message = (
         f"FINAL TEST[{args.experiment_name}]: "
         f"mIoU={miou:.4f} "
@@ -227,5 +231,6 @@ def run_full_evaluation(model, test_loader, args, logger=None):
     return {
         "iou": iou,
         "miou": miou,
+        "average_precision_matrix": map_metrics["average_precision_matrix"],
         **map_metrics,
     }

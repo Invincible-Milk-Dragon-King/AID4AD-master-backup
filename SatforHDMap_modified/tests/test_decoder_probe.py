@@ -57,7 +57,7 @@ def test_resolve_decoder_probe_config_maps_feature_sources():
     assert camera_only.load_strict is True
     assert fusion_camera.decoder_type == "camera"
     assert fusion_camera.branch_mode == "camera_only"
-    assert fusion_camera.load_strict is False
+    assert fusion_camera.load_strict is True
     assert fusion_sat.decoder_type == "satellite"
     assert fusion_sat.branch_mode == "sat_only"
     assert fusion_sat.load_strict is True
@@ -110,3 +110,43 @@ def test_validate_decoder_probe_load_result_rejects_missing_keys():
         assert "Missing keys" in str(exc)
     else:
         raise AssertionError("Expected missing probe keys to be rejected.")
+
+
+def test_validate_decoder_probe_load_result_allows_legacy_unused_missing_keys():
+    decoder_probe = _load_decoder_probe_module()
+    config = decoder_probe.resolve_decoder_probe_config("camera_only_camera")
+
+    decoder_probe.validate_decoder_probe_load_result(
+        config,
+        missing_keys=[
+            "prior_map_encoder.encoder.conv_last.weight",
+            "satellite_bevencode.conv1.weight",
+            "bevencode.conv1.weight",
+            "fusion.alignfusion.gate.gate.0.weight",
+            "seg.conv_last.weight",
+        ],
+        unexpected_keys=[],
+    )
+
+
+def test_normalize_legacy_camera_state_dict_remaps_bevencode_to_camera_bevencode():
+    decoder_probe = _load_decoder_probe_module()
+    legacy_weight = torch.ones(64, 64, 7, 7)
+    state_dict = {
+        "camencode.trunk._conv_stem.weight": torch.ones(32, 3, 3, 3),
+        "bevencode.conv1.weight": legacy_weight,
+    }
+    model_state_dict = {
+        "camencode.trunk._conv_stem.weight": torch.zeros(32, 3, 3, 3),
+        "camera_bevencode.conv1.weight": torch.zeros(64, 64, 7, 7),
+        "bevencode.conv1.weight": torch.zeros(64, 128, 7, 7),
+    }
+
+    normalized, is_legacy = decoder_probe.normalize_legacy_camera_state_dict(
+        state_dict,
+        model_state_dict,
+    )
+
+    assert is_legacy is True
+    assert "bevencode.conv1.weight" not in normalized
+    assert torch.equal(normalized["camera_bevencode.conv1.weight"], legacy_weight)

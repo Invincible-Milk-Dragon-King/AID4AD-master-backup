@@ -51,8 +51,18 @@ def main(args):
         'angle_class': args.angle_class,
     }
 
-    train_loader, val_loader = semantic_dataset(args.version, args.dataroot, data_conf, args.bsz, args.nworkers)
-    model = get_model(args.model, data_conf, args.instance_seg, args.embedding_dim, args.direction_pred, args.angle_class)
+    train_loader, val_loader = semantic_dataset(
+        args.version,
+        args.dataroot,
+        args.prior_map_root,
+        data_conf,
+        args.bsz,
+        args.nworkers,
+        False,
+        (args.satellite_img_w, args.satellite_img_h),
+        is_newsplit=args.is_newsplit,
+    )
+    model = get_model(args.model, data_conf, args, args.instance_seg, args.embedding_dim, args.direction_pred, args.angle_class)
     model.load_state_dict(torch.load(args.modelf), strict=False)
     model.cuda()
     print(eval_iou(model, val_loader))
@@ -62,16 +72,25 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # multi_gpu config
     parser.add_argument("--multi_gpu", type=bool, default=True)
+    parser.add_argument("--is_newsplit", action='store_true')
 
     # logging config
     parser.add_argument("--logdir", type=str, default='./runs')
 
     # nuScenes config
     parser.add_argument('--dataroot', type=str, default='dataset/nuScenes/')
+    parser.add_argument('--prior_map_root', type=str, default='./satmap/satellite_map_trainval')
     parser.add_argument('--version', type=str, default='v1.0-mini', choices=['v1.0-trainval', 'v1.0-mini'])
 
     # model config
     parser.add_argument("--model", type=str, default='HDMapNet_cam')
+    parser.add_argument("--fusion_mode", type=str, default='seg-masked-atten', choices=['attention', 'swin-atten', 'deform-atten', 'masked-atten', 'seg-masked-atten'])
+    parser.add_argument("--branch_mode", type=str, default='camera_only', choices=['camera_only', 'sat_only', 'fusion', 'drop_satellite', 'drop_camera'])
+    parser.add_argument('--align_fusion', action='store_true')
+    parser.add_argument("--return_branch_features", action='store_true')
+    parser.add_argument('--satellite_img_h', type=int, default=200)
+    parser.add_argument('--satellite_img_w', type=int, default=400)
+    parser.add_argument("--local_rank", "--local-rank", dest="local_rank", type=int, default=0)
 
     # training config
     parser.add_argument("--nepochs", type=int, default=30)

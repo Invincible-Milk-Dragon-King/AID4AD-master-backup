@@ -12,6 +12,7 @@ from model import get_model
 from branch_eval import run_full_evaluation
 
 
+PAPER_MAP_THRESHOLDS = [0.2, 0.5, 1.0]
 SAMPLED_RECALLS = torch.linspace(0.1, 1, 10)
 THRESHOLDS = [2, 4, 6]
 
@@ -58,6 +59,7 @@ if __name__ == '__main__':
     parser.add_argument("--local_rank", "--local-rank", dest="local_rank", type=int, default=0)
     parser.add_argument("--fusion_mode", type=str, default='seg-masked-atten', choices=['attention', 'swin-atten', 'deform-atten', 'masked-atten', 'seg-masked-atten'])
     parser.add_argument("--branch_mode", type=str, default='fusion', choices=['camera_only', 'sat_only', 'fusion', 'drop_satellite', 'drop_camera'])
+    parser.add_argument("--map_thresholds", nargs="+", type=float, default=PAPER_MAP_THRESHOLDS)
     parser.add_argument("--align_fusion", action='store_true')
     parser.add_argument("--experiment_name", type=str, default='fusion_base')
     parser.add_argument("--return_branch_features", action='store_true')
