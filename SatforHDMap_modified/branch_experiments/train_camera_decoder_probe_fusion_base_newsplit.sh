@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-5,7}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1,2}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 MASTER_PORT="${MASTER_PORT:-29607}"
 LOGDIR="${LOGDIR:-./branch_runs/camera_decoder_probe_fusion_base_newsplit}"
