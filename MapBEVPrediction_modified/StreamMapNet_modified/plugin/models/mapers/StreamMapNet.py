@@ -15,12 +15,14 @@ from ..utils.memory_buffer import StreamTensorMemory
 from mmcv.cnn.utils import constant_init, kaiming_init
 from .branch_protocol import (
     BRANCH_MODE_CAMERA_ONLY,
-    BRANCH_MODE_FUSION,
+    BRANCH_MODE_DROP_CAMERA,
     BRANCH_MODE_DROP_SATELLITE,
+    BRANCH_MODE_FUSION,
     BRANCH_MODE_SATELLITE_ONLY,
     resolve_branch_mode,
     uses_aerial_encoder,
     uses_aerial_fuser,
+    uses_camera_encoder,
 )
 
 @MAPPERS.register_module()
@@ -41,6 +43,7 @@ class StreamMapNet(BaseMapper):
                  branch_mode=None,
                  return_branch_features=False,
                  distill_cfg=None,
+                 probe_cfg=None,
                  **kwargs):
         super().__init__()
 
@@ -53,9 +56,12 @@ class StreamMapNet(BaseMapper):
         self.branch_mode = resolve_branch_mode(use_AID4AD, AID4AD_only, branch_mode)
         self.return_branch_features = return_branch_features
         self.distill_cfg = distill_cfg or {}
+        self.probe_cfg = probe_cfg or {}
         self.distill_feature = self.distill_cfg.get('feature_name', 'camera_branch_feature')
         self.distill_loss = self.distill_cfg.get('loss_name', 'mse')
         self.distill_weight = self.distill_cfg.get('loss_weight', 0.0)
+        self.distill_use_mask = self.distill_cfg.get('use_mask', False)
+        self.distill_mask_thickness = self.distill_cfg.get('mask_thickness', 3)
         self.teacher_branch_mode = self.distill_cfg.get('teacher_branch_mode', BRANCH_MODE_CAMERA_ONLY)
         self.teacher_ckpt = self.distill_cfg.get('teacher_ckpt')
         self.teacher_model = None
@@ -165,11 +171,30 @@ class StreamMapNet(BaseMapper):
             parameter.requires_grad = False
         return teacher_model
 
+    def _satellite_feature_channels(self):
+        if not self.use_AID4AD:
+            return 0
+        return self.aid_downsampler.conv[-2].out_channels
+
+    def _zero_satellite_feature(self, reference_feature):
+        channels = self._satellite_feature_channels()
+        return torch.zeros(
+            reference_feature.size(0),
+            channels,
+            reference_feature.size(2),
+            reference_feature.size(3),
+            device=reference_feature.device,
+            dtype=reference_feature.dtype,
+        )
+
+    def _zero_camera_feature(self, reference_feature):
+        return torch.zeros_like(reference_feature)
+
     def extract_branch_features(self, img, aerial_img=None, points=None, img_metas=None, branch_mode=None):
         branch_mode = branch_mode or self.branch_mode
 
         camera_branch_feature = None
-        if branch_mode != BRANCH_MODE_SATELLITE_ONLY:
+        if uses_camera_encoder(branch_mode):
             camera_branch_feature = self.backbone(img, img_metas=img_metas, points=points)
 
         satellite_branch_feature = None
@@ -179,12 +204,21 @@ class StreamMapNet(BaseMapper):
 
         if branch_mode == BRANCH_MODE_SATELLITE_ONLY:
             fusion_feature = satellite_branch_feature
+        elif branch_mode == BRANCH_MODE_CAMERA_ONLY:
+            fusion_feature = camera_branch_feature
+        elif branch_mode == BRANCH_MODE_DROP_SATELLITE:
+            satellite_branch_feature = self._zero_satellite_feature(camera_branch_feature)
+            fusion_feature = self.aid_fuser(
+                torch.cat([camera_branch_feature, satellite_branch_feature], dim=1))
+        elif branch_mode == BRANCH_MODE_DROP_CAMERA:
+            camera_branch_feature = self._zero_camera_feature(satellite_branch_feature)
+            fusion_feature = self.aid_fuser(
+                torch.cat([camera_branch_feature, satellite_branch_feature], dim=1))
         elif uses_aerial_fuser(branch_mode):
-            fusion_feature = self.aid_fuser(torch.cat([camera_branch_feature, satellite_branch_feature], dim=1))
+            fusion_feature = self.aid_fuser(
+                torch.cat([camera_branch_feature, satellite_branch_feature], dim=1))
         else:
             fusion_feature = camera_branch_feature
-            if branch_mode == BRANCH_MODE_DROP_SATELLITE:
-                satellite_branch_feature = torch.zeros_like(camera_branch_feature)
 
         return {
             'branch_mode': branch_mode,
@@ -193,10 +227,94 @@ class StreamMapNet(BaseMapper):
             'fusion_feature': fusion_feature,
         }
 
-    def _compute_distillation_loss(self, student_feature, teacher_feature):
+    def get_probe_decoder(self, decoder_type):
+        if decoder_type not in ('camera', 'satellite', 'head'):
+            raise ValueError(f'Unsupported probe decoder type: {decoder_type}')
+        return self.head
+
+    def get_probe_encoder_modules(self, decoder_type):
+        if decoder_type == 'camera':
+            modules = [self.backbone]
+            if self.streaming_bev:
+                modules.append(self.stream_fusion_neck)
+            modules.extend([self.neck])
+            if self.use_AID4AD:
+                modules.extend([self.aid_encoder, self.aid_downsampler, self.aid_fuser])
+            return modules
+        if decoder_type == 'satellite':
+            modules = [self.aid_encoder, self.aid_downsampler]
+            if self.use_AID4AD:
+                modules.extend([self.aid_fuser])
+            if self.streaming_bev:
+                modules.append(self.stream_fusion_neck)
+            modules.extend([self.neck, self.backbone])
+            return modules
+        raise ValueError(f'Unsupported probe decoder type: {decoder_type}')
+
+    def _rasterize_vector_line(self, foreground_mask, line):
+        if line.ndim == 3:
+            line = line[0]
+        if line.shape[0] < 2:
+            return
+
+        height, width = foreground_mask.shape
+        line = line[:, :2].to(device=foreground_mask.device, dtype=torch.float32)
+        line = line.clamp(0.0, 1.0)
+        coords = torch.stack([
+            line[:, 0] * (width - 1),
+            line[:, 1] * (height - 1),
+        ], dim=-1)
+
+        radius = max(int(self.distill_mask_thickness) // 2, 0)
+        for start, end in zip(coords[:-1], coords[1:]):
+            delta = end - start
+            steps = int(torch.ceil(delta.abs().max()).item()) + 1
+            if steps <= 1:
+                samples = start.view(1, 2)
+            else:
+                t = torch.linspace(0, 1, steps, device=foreground_mask.device)
+                samples = start.view(1, 2) * (1 - t).view(-1, 1) + end.view(1, 2) * t.view(-1, 1)
+
+            xs = samples[:, 0].round().long().clamp(0, width - 1)
+            ys = samples[:, 1].round().long().clamp(0, height - 1)
+            for dx in range(-radius, radius + 1):
+                for dy in range(-radius, radius + 1):
+                    px = (xs + dx).clamp(0, width - 1)
+                    py = (ys + dy).clamp(0, height - 1)
+                    foreground_mask[py, px] = True
+
+    def _build_distill_non_mask(self, vectors, spatial_size, device):
+        """Match Satfor KD: distill where GT map foreground is absent."""
+        height, width = spatial_size
+        foreground = torch.zeros((len(vectors), height, width), dtype=torch.bool, device=device)
+        for batch_idx, vector_by_label in enumerate(vectors):
+            for _label, lines in vector_by_label.items():
+                for line in lines:
+                    self._rasterize_vector_line(
+                        foreground[batch_idx],
+                        torch.as_tensor(line),
+                    )
+        return ~foreground
+
+    def _compute_distillation_loss(self, student_feature, teacher_feature, non_mask=None):
+        teacher_feature = teacher_feature.detach()
+        scale = teacher_feature.pow(2).mean().sqrt().clamp_min(1e-6)
+        student_norm = student_feature / scale
+        teacher_norm = teacher_feature / scale
+        if non_mask is not None:
+            if non_mask.shape[-2:] != student_norm.shape[-2:]:
+                non_mask = F.interpolate(
+                    non_mask.float().unsqueeze(1),
+                    size=student_norm.shape[-2:],
+                    mode='nearest',
+                ).squeeze(1).bool()
+            student_norm = student_norm.permute(0, 2, 3, 1)[non_mask]
+            teacher_norm = teacher_norm.permute(0, 2, 3, 1)[non_mask]
+            if student_norm.numel() == 0:
+                return student_feature.new_zeros(())
         if self.distill_loss == 'l1':
-            return F.l1_loss(student_feature, teacher_feature.detach())
-        return F.mse_loss(student_feature, teacher_feature.detach())
+            return F.l1_loss(student_norm, teacher_norm)
+        return F.mse_loss(student_norm, teacher_norm)
 
     def update_bev_feature(self, curr_bev_feats, img_metas):
         '''
@@ -316,9 +434,17 @@ class StreamMapNet(BaseMapper):
                     img_metas=img_metas,
                     branch_mode=self.teacher_branch_mode,
                 )
+            non_mask = None
+            if self.distill_use_mask:
+                non_mask = self._build_distill_non_mask(
+                    vectors,
+                    branch_features[self.distill_feature].shape[-2:],
+                    branch_features[self.distill_feature].device,
+                )
             distill_loss = self._compute_distillation_loss(
                 branch_features[self.distill_feature],
                 teacher_branch_features[self.distill_feature],
+                non_mask=non_mask,
             )
             distill_term = distill_loss * self.distill_weight
             loss = loss + distill_term

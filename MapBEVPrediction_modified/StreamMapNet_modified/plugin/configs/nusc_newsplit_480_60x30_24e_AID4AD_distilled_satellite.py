@@ -10,9 +10,9 @@ model = dict(
     return_branch_features=True,
     distill_cfg=dict(
         _delete_=True,
-        teacher_ckpt='./branch_runs/camera_only_newsplit/model_last.pth',
-        teacher_branch_mode='camera_only',
-        feature_name='camera_branch_feature',
+        teacher_ckpt='./branch_runs/sat_only_newsplit/model_last.pth',
+        teacher_branch_mode='satellite_only',
+        feature_name='satellite_branch_feature',
         loss_name='mse',
         loss_weight=1.0,
         use_mask=True,
@@ -25,7 +25,7 @@ custom_hooks = [
         type='BranchPostTrainHook',
         priority='LOW',
         eval_after_train=True,
-        experiment_name='fusion_distilled_camera_newsplit',
+        experiment_name='fusion_distilled_satellite_newsplit',
         branch_mode='fusion',
     ),
 ]
