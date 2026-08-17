@@ -1,0 +1,60 @@
+% 建图模态退化主表（仅替换主文档中 tab:camera_degradation_probe 对应片段）
+% 选定模型：HDMapNet, MapTR, ADMap, GeMap, HIMap
+% 指标更新：2026-08-17
+% - HDMapNet: Satfor 协议（baseline_*.log + probe_*.log）
+% - MapTR / GeMap / HIMap: 严格 decoder-only（冻 BEV encoder/fuser）
+% - ADMap: 按用户要求保留现有 probe 结果（未按严格 freeze 重跑）
+
+\begin{table*}[t]
+\centering
+\caption{
+Camera-modality degradation evaluation on online HD map construction.
+For each method, the encoder/backbone is initialized from an existing or self-trained checkpoint and kept frozen.
+Only a lightweight camera decoder probe is trained, following the protocol in SatforHDMap.
+}
+\label{tab:camera_degradation_probe}
+\scriptsize
+\setlength{\tabcolsep}{3.2pt}
+\begin{tabular}{c c c c cc cc cc cc c}
+\toprule
+\multirow{2}{*}{Method} &
+\multirow{2}{*}{Rep.} &
+\multirow{2}{*}{Backbone} &
+\multirow{2}{*}{Epoch} &
+\multicolumn{2}{c}{Full C} &
+\multicolumn{2}{c}{Full C+L} &
+\multicolumn{2}{c}{Probe(C)} &
+\multicolumn{2}{c}{Probe(C+L$\rightarrow$C)} &
+\multirow{2}{*}{FPS} \\
+\cmidrule(lr){5-6}
+\cmidrule(lr){7-8}
+\cmidrule(lr){9-10}
+\cmidrule(lr){11-12}
+& & & &
+mIoU & mAP &
+mIoU & mAP &
+mIoU & mAP &
+mIoU & mAP &
+\\
+\midrule
+
+HDMapNet     & Raster & EffNet-B0 & 30 & 0.289 & -- & 0.401 & -- & 0.286 & -- & 0.213 & -- & -- \\
+MapTR        & Vector & R50       & 24 & --    & 0.441 & -- & 0.609 & -- & 0.451 & -- & 0.349 & -- \\
+ADMap        & Vector & R50       & 24 & --    & 0.463 & -- & 0.640 & -- & 0.504 & -- & 0.294 & -- \\
+GeMap        & Vector & R50       & 24 & --    & 0.627 & -- & 0.665 & -- & 0.608 & -- & 0.598 & -- \\
+HIMap        & Vector & R50       & 24 & --    & 0.582 & -- & 0.715 & -- & 0.593 & -- & 0.552 & -- \\
+
+\bottomrule
+\end{tabular}
+
+\vspace{0.5em}
+\begin{flushleft}
+\footnotesize
+\textbf{Protocol.}
+\textit{Full C} and \textit{Full C+L} denote the original model performance using camera-only and camera-LiDAR inputs, respectively.
+\textit{Probe(C)} freezes the camera-side encoder and trains only a camera decoder.
+\textit{Probe(C+L$\rightarrow$C)} freezes the camera-side encoder from the fusion checkpoint, removes LiDAR input, and trains only a camera decoder on the camera-side feature.
+\textit{Backbone} and \textit{Epoch} report the frozen backbone configuration and training epoch used for the probe.
+\textit{FPS} denotes inference speed.
+\end{flushleft}
+\end{table*}

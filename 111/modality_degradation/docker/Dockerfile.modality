@@ -1,0 +1,24 @@
+FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Asia/Shanghai
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget curl vim ca-certificates \
+    build-essential pkg-config \
+    ffmpeg ninja-build \
+    libglib2.0-0 libsm6 libxext6 libxrender-dev libgl1-mesa-glx \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CONDA_DIR=/opt/conda
+RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh \
+    && bash /tmp/miniconda.sh -b -p ${CONDA_DIR} \
+    && rm /tmp/miniconda.sh
+ENV PATH=${CONDA_DIR}/bin:$PATH
+
+RUN conda init bash
+
+WORKDIR /workspace
+CMD ["/bin/bash", "-l"]

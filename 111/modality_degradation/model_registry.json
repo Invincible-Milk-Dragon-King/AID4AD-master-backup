@@ -1,0 +1,118 @@
+{
+  "hdmapnet": {
+    "launch_style": "satfor_probe",
+    "repo_root": "HDMapNet",
+    "entry_script": "train.py",
+    "base_args": [
+      "--instance_seg",
+      "--direction_pred",
+      "--version", "v1.0-trainval",
+      "--dataroot", "dataset/nuScenes"
+    ],
+    "source_to_model": {
+      "camera": "HDMapNet_cam",
+      "fusion": "HDMapNet_fusion",
+      "lidar": "HDMapNet_lidar",
+      "fusion_lidar": "HDMapNet_fusion"
+    },
+    "source_to_feature": {
+      "camera": "camera_only_camera",
+      "fusion": "fusion_base_camera",
+      "lidar": "lidar_only_lidar",
+      "fusion_lidar": "fusion_base_lidar"
+    },
+    "probe_epochs": 24,
+    "logdir_prefix": "./branch_runs"
+  },
+  "maptr": {
+    "launch_style": "mmdet_probe",
+    "repo_root": "MapTR",
+    "entry_script": "tools/train.py",
+    "source_to_config": {
+      "camera": "projects/configs/maptr/maptr_tiny_r50_24e.py",
+      "fusion": "projects/configs/maptr/maptr_tiny_fusion_24e.py"
+    },
+    "cfg_options": [
+      "model.img_backbone.frozen_stages=4",
+      "data.train.ann_file=data/nuscenes_infos_temporal_train_with_maploc.pkl"
+    ],
+    "decoder_train_keywords": "pts_bbox_head",
+    "decoder_freeze_keywords": "transformer.encoder,transformer.fuser,bev_embedding,positional_encoding,level_embeds,cams_embeds,can_bus_mlp,reference_points,compress_layer,conv_mask_bev_embed,conv_bev_embed,sem_classifier,pts_bbox_head.backbone,pts_bbox_head.neck,lidar_modal",
+    "source_to_feature": {
+      "camera": "camera_only_camera",
+      "fusion": "fusion_base_camera"
+    },
+    "logdir_prefix": "./branch_runs"
+  },
+  "admap": {
+    "launch_style": "mmdet_probe",
+    "repo_root": "ADMap-main",
+    "entry_script": "tools/train.py",
+    "source_to_config": {
+      "camera": "configs/ADMap_cam_24e.py",
+      "fusion": "configs/ADMap_fusion_24e.py"
+    },
+    "cfg_options": [
+      "model.img_backbone.frozen_stages=4",
+      "find_unused_parameters=True",
+      "data.workers_per_gpu=2"
+    ],
+    "decoder_train_keywords": "pts_bbox_head",
+    "decoder_freeze_keywords": "transformer.encoder,transformer.fuser,bev_embedding,positional_encoding,level_embeds,cams_embeds,can_bus_mlp,reference_points,compress_layer,conv_mask_bev_embed,conv_bev_embed,sem_classifier,pts_bbox_head.backbone,pts_bbox_head.neck,lidar_modal",
+    "source_to_feature": {
+      "camera": "camera_only_camera",
+      "fusion": "fusion_base_camera"
+    },
+    "logdir_prefix": "./branch_runs",
+    "probe_global_batch": 8,
+    "probe_global_batch_by_source": {
+      "camera": 8,
+      "fusion": 4
+    }
+  },
+  "gemap": {
+    "launch_style": "mmdet_probe",
+    "repo_root": "GeMap",
+    "entry_script": "tools/train.py",
+    "probe_epochs": 24,
+    "source_to_config": {
+      "camera": "projects/configs/gemap/gemap_simple_r50_110ep.py",
+      "fusion": "projects/configs/gemap/gemap_simple_r50_sec_110ep.py"
+    },
+    "cfg_options": [
+      "model.img_backbone.frozen_stages=4"
+    ],
+    "decoder_train_keywords": "pts_bbox_head",
+    "decoder_freeze_keywords": "transformer.encoder,transformer.fuser,bev_embedding,positional_encoding,level_embeds,cams_embeds,can_bus_mlp,reference_points,compress_layer,conv_mask_bev_embed,conv_bev_embed,sem_classifier,pts_bbox_head.backbone,pts_bbox_head.neck,lidar_modal",
+    "source_to_feature": {
+      "camera": "camera_only_camera",
+      "fusion": "fusion_base_camera"
+    },
+    "logdir_prefix": "./branch_runs"
+  },
+  "himap": {
+    "launch_style": "mmdet_probe",
+    "repo_root": "HIMap",
+    "entry_script": "tools/train.py",
+    "config_arg": "--config",
+    "source_to_config": {
+      "camera": "projects/configs/sensor_missing/himap_tiny_cam_24e.py",
+      "fusion": "projects/configs/sensor_missing/himap_tiny_fusion_24e.py",
+      "lidar": "projects/configs/sensor_missing/himap_tiny_lidar_24e.py",
+      "fusion_lidar": "projects/configs/sensor_missing/himap_tiny_fusion_24e.py"
+    },
+    "cfg_options": [
+      "model.img_backbone.frozen_stages=4"
+    ],
+    "decoder_train_keywords": "pts_bbox_head",
+    "decoder_freeze_keywords": "transformer.encoder,transformer.fuser,bev_embedding,positional_encoding,level_embeds,cams_embeds,can_bus_mlp,reference_points,compress_layer,conv_mask_bev_embed,conv_bev_embed,sem_classifier,pts_bbox_head.backbone,pts_bbox_head.neck,lidar_modal",
+    "source_to_feature": {
+      "camera": "camera_only_camera",
+      "fusion": "fusion_base_camera",
+      "lidar": "lidar_only_lidar",
+      "fusion_lidar": "fusion_base_lidar"
+    },
+    "probe_epochs": 24,
+    "logdir_prefix": "./branch_runs"
+  }
+}

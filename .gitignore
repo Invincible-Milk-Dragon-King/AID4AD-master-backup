@@ -39,3 +39,8 @@ AID4AD_ego_referenced/
 SatforHDMap_modified/dataset/
 SatforHDMap_modified/satmap/
 
+# Modality-degradation local artifacts under 111/
+111/**/branch_runs/
+111/**/work_dirs/
+111/checkpoints/
+111/**/outputs/
